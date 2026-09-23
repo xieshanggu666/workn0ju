@@ -3,9 +3,12 @@
 // energy_records 中已结分段 + energy_segments 中未结运行段（功率×时长实时
 // 折算）聚合到当前周期用量，达到额度 80% 触发预警、100% 触发超标告警。
 //
-// 闭环：同一额度同一周期只保留一条未关闭告警（预警可升级为超标，不重复打扰）；
-// 告警保留 待处理→处理中→已处理/已忽略 状态与备注；额度调整留痕可追溯；
-// 跨周期旧告警自动结转关闭；额度删除后其未关闭告警自动解除。
+// 告警身份 = (quota_id, period, period_start)：定额周期或额度调整后，评估器按
+// 最新配置重新对账——旧身份告警结转留痕、阈值变化驱动升级/降级/解除/重开，
+// 快照（周期/阈值/名称）实时同步，杜绝沿用旧周期旧阈值造成的误报漏报。
+// 闭环：同一身份只保留一条告警（预警可升级为超标，不重复打扰）；
+// 待处理→处理中→已处理/已忽略 状态与备注全程保留；跨周期自动结转关闭；
+// 停用/删除额度后未关闭告警自动解除。
 
 const TICK_MS = 30_000          // 与 energy.js 模拟节拍一致：持续聚合、及时触发
 const WARN_RATIO = 0.8          // 用量达额度 80% 预警
@@ -19,6 +22,66 @@ let stmts
 // 通过注入回调写日志/通知，避免与 index.js 循环依赖
 let notify = () => {}
 const round4 = (v) => Math.round(v * 10000) / 10000
+
+// 旧库升级：旧身份约束 UNIQUE(quota_id, period_start) 不含周期类型，切换周期可能撞键；
+// 重建表换成 (quota_id, period, period_start) 并补 notified_at，历史告警一条不丢。
+function migrateAlertsSchema() {
+  const cols = db.prepare('PRAGMA table_info(quota_alerts)').all().map((c) => c.name)
+  if (!cols.length) return // 首次启动，CREATE TABLE 已是新结构
+  const indexes = db.prepare("PRAGMA index_list(quota_alerts)").all().map((i) => i.name)
+  if (cols.includes('notified_at') && indexes.includes('idx_quota_alerts_identity')) return
+  db.exec('BEGIN')
+  try {
+    db.exec(`ALTER TABLE quota_alerts RENAME TO quota_alerts_old`)
+    db.exec(`CREATE TABLE quota_alerts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      quota_id INTEGER NOT NULL,
+      scope TEXT NOT NULL,
+      target_name TEXT NOT NULL,
+      period TEXT NOT NULL,
+      period_start TEXT NOT NULL,
+      period_end TEXT NOT NULL,
+      level TEXT NOT NULL,
+      used_kwh REAL NOT NULL,
+      limit_kwh REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open',
+      note TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      handled_at TEXT,
+      notified_at TEXT
+    )`)
+    const oldCols = db.prepare('PRAGMA table_info(quota_alerts_old)').all().map((c) => c.name)
+    const notified = oldCols.includes('notified_at') ? 'notified_at' : 'NULL'
+    db.exec(`INSERT INTO quota_alerts
+      (id,quota_id,scope,target_name,period,period_start,period_end,level,used_kwh,limit_kwh,status,note,created_at,updated_at,handled_at,notified_at)
+      SELECT id,quota_id,scope,target_name,period,period_start,period_end,level,used_kwh,limit_kwh,status,note,created_at,updated_at,handled_at,${notified}
+      FROM quota_alerts_old`)
+    db.exec('DROP TABLE quota_alerts_old')
+    db.exec('CREATE INDEX idx_quota_alerts_status ON quota_alerts(status)')
+    db.exec('CREATE INDEX idx_quota_alerts_quota ON quota_alerts(quota_id)')
+    db.exec('CREATE UNIQUE INDEX idx_quota_alerts_identity ON quota_alerts(quota_id, period, period_start)')
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+}
+
+// 旧库留痕表补 scope/target_name 快照列，并尽可能从额度/告警回填
+function migrateAdjustmentsColumns() {
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='quota_adjustments'").get()
+  if (!exists) return
+  const cols = db.prepare('PRAGMA table_info(quota_adjustments)').all().map((c) => c.name)
+  if (!cols.includes('scope')) db.exec('ALTER TABLE quota_adjustments ADD COLUMN scope TEXT')
+  if (!cols.includes('target_name')) db.exec('ALTER TABLE quota_adjustments ADD COLUMN target_name TEXT')
+  db.exec(`UPDATE quota_adjustments SET
+    scope = COALESCE(scope, (SELECT scope FROM energy_quotas WHERE id=quota_id),
+                            (SELECT scope FROM quota_alerts WHERE quota_id=quota_adjustments.quota_id LIMIT 1)),
+    target_name = COALESCE(target_name, (SELECT target_name FROM energy_quotas WHERE id=quota_id),
+                            (SELECT target_name FROM quota_alerts WHERE quota_id=quota_adjustments.quota_id LIMIT 1))
+    WHERE scope IS NULL OR target_name IS NULL`)
+}
 
 export function initQuota(database, notifyFn) {
   db = database
@@ -43,7 +106,7 @@ export function initQuota(database, notifyFn) {
     scope TEXT NOT NULL,
     target_name TEXT NOT NULL,
     period TEXT NOT NULL,
-    period_start TEXT NOT NULL,       -- 告警所属周期起点，周期粒度去重/结转依据
+    period_start TEXT NOT NULL,       -- 告警所属周期起点；身份键含 period，切换周期后旧告警原样留存
     period_end TEXT NOT NULL,
     level TEXT NOT NULL,              -- warn(80%) / error(100%)
     used_kwh REAL NOT NULL,
@@ -53,10 +116,13 @@ export function initQuota(database, notifyFn) {
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     handled_at TEXT,
-    UNIQUE(quota_id, period_start)
+    notified_at TEXT                  -- 最近一次通知（新建/升级/重开）时间，前端据此去重，避免重复打扰
   );
   CREATE INDEX IF NOT EXISTS idx_quota_alerts_status ON quota_alerts(status);
   CREATE INDEX IF NOT EXISTS idx_quota_alerts_quota ON quota_alerts(quota_id);
+  -- 身份键含周期类型：同一额度的日/周/月告警可并存留痕，切换周期不再撞键丢告警
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_alerts_identity
+    ON quota_alerts(quota_id, period, period_start);
   CREATE TABLE IF NOT EXISTS quota_adjustments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     quota_id INTEGER NOT NULL,
@@ -65,11 +131,17 @@ export function initQuota(database, notifyFn) {
     new_limit REAL,
     old_period TEXT,
     new_period TEXT,
+    scope TEXT,                       -- 对象类型快照：额度删除后留痕仍可展示
+    target_name TEXT,                 -- 对象名快照
     reason TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_quota_adjustments_quota ON quota_adjustments(quota_id);
   `)
+  // 旧库迁移：身份键 (quota_id,period_start) → (quota_id,period,period_start)，并补 notified_at
+  migrateAlertsSchema()
+  // 留痕表补对象快照列：额度删除后历史仍能显示对象
+  migrateAdjustmentsColumns()
   stmts = {
     allQuotas: db.prepare('SELECT * FROM energy_quotas ORDER BY id'),
     quotaById: db.prepare('SELECT * FROM energy_quotas WHERE id=?'),
@@ -80,24 +152,34 @@ export function initQuota(database, notifyFn) {
     updateQuota: db.prepare('UPDATE energy_quotas SET limit_kwh=?,period=?,enabled=?,updated_at=? WHERE id=?'),
     deleteQuota: db.prepare('DELETE FROM energy_quotas WHERE id=?'),
     insertAdj: db.prepare(`INSERT INTO quota_adjustments
-      (quota_id,action,old_limit,new_limit,old_period,new_period,reason,created_at)
-      VALUES (?,?,?,?,?,?,?,?)`),
+      (quota_id,action,old_limit,new_limit,old_period,new_period,scope,target_name,reason,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`),
     adjByQuota: db.prepare('SELECT * FROM quota_adjustments WHERE quota_id=? ORDER BY id DESC LIMIT 30'),
-    allAdj: db.prepare(`SELECT a.*, q.scope, q.target_name FROM quota_adjustments a
+    allAdj: db.prepare(`SELECT a.*,
+                        COALESCE(a.scope, q.scope, al.scope) AS scope,
+                        COALESCE(a.target_name, q.target_name, al.target_name) AS target_name
+                        FROM quota_adjustments a
                         LEFT JOIN energy_quotas q ON q.id=a.quota_id
+                        LEFT JOIN (
+                          SELECT quota_id, scope, target_name,
+                                 ROW_NUMBER() OVER (PARTITION BY quota_id ORDER BY id DESC) rn
+                          FROM quota_alerts
+                        ) al ON al.quota_id=a.quota_id AND al.rn=1
                         ORDER BY a.id DESC LIMIT 50`),
     recRoom: db.prepare('SELECT COALESCE(SUM(kwh),0) v FROM energy_records WHERE room=? AND end_time>=?'),
     recDevice: db.prepare('SELECT COALESCE(SUM(kwh),0) v FROM energy_records WHERE device_id=? AND end_time>=?'),
     segRoom: db.prepare('SELECT * FROM energy_segments WHERE room=?'),
     segDevice: db.prepare('SELECT * FROM energy_segments WHERE device_id=?'),
-    activeAlert: db.prepare('SELECT * FROM quota_alerts WHERE quota_id=? AND period_start=?'),
+    activeAlert: db.prepare('SELECT * FROM quota_alerts WHERE quota_id=? AND period=? AND period_start=?'),
     insertAlert: db.prepare(`INSERT INTO quota_alerts
-      (quota_id,scope,target_name,period,period_start,period_end,level,used_kwh,limit_kwh,status,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)`),
-    raiseAlert: db.prepare('UPDATE quota_alerts SET level=?,used_kwh=?,limit_kwh=?,updated_at=? WHERE id=?'),
+      (quota_id,scope,target_name,period,period_start,period_end,level,used_kwh,limit_kwh,status,created_at,updated_at,notified_at)
+      VALUES (?,?,?,?,?,?,?,?,?,'open',?,?,?)`),
+    refreshAlert: db.prepare('UPDATE quota_alerts SET scope=?,target_name=?,period_end=?,level=?,used_kwh=?,limit_kwh=?,updated_at=? WHERE id=?'),
     touchAlert: db.prepare('UPDATE quota_alerts SET used_kwh=?,updated_at=? WHERE id=?'),
+    reopenAlert: db.prepare('UPDATE quota_alerts SET status=?,level=?,used_kwh=?,limit_kwh=?,scope=?,target_name=?,period=?,period_start=?,period_end=?,note=?,handled_at=NULL,updated_at=?,notified_at=? WHERE id=?'),
+    markNotified: db.prepare('UPDATE quota_alerts SET notified_at=? WHERE id=?'),
     openAlerts: db.prepare("SELECT * FROM quota_alerts WHERE status IN ('open','handling')"),
-    staleByQuota: db.prepare("SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling') AND period_start<>?"),
+    openByQuota: db.prepare("SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling')"),
     closeAlert: db.prepare('UPDATE quota_alerts SET status=?,note=?,handled_at=?,updated_at=? WHERE id=?')
   }
 
@@ -147,41 +229,106 @@ function computeUsage(quota, at = new Date()) {
   return round4(v)
 }
 
-// ===== 核心评估：全量额度聚合 → 触发/升级/更新告警；跨周期与已删额度结转 =====
+// ===== 核心评估：按「最新配置 + 最新用量」对账每条额度 =====
+// 身份不一致的旧告警（跨周期 / 换周期）结转关闭；停用额度解除告警；
+// 阈值变化驱动 新建 / 升级 / 降级 / 解除 / 已闭环重开；快照同步刷新。
 export function evaluateAll(at = new Date()) {
   const quotas = stmts.allQuotas.all()
   const liveQuotaIds = new Set(quotas.map((q) => q.id))
   let changed = false
+  const iso = at.toISOString()
 
   for (const q of quotas) {
-    if (!q.enabled) continue
     const { start, end } = periodRange(q.period, at)
-    // 跨周期：上一周期仍未关闭的告警自动结转（关闭），新周期重新评估
-    for (const old of stmts.staleByQuota.all(q.id, start.toISOString())) {
-      stmts.closeAlert.run('ignored', appendNote(old.note, '周期结束自动结转关闭'), at.toISOString(), at.toISOString(), old.id)
+    const startIso = start.toISOString()
+
+    // 未关闭告警与「当前配置身份(period, period_start)」不一致：
+    // 跨周期自然结转，或管理员切换了周期类型——旧告警留痕关闭，绝不沿用旧周期。
+    for (const old of stmts.openByQuota.all(q.id)) {
+      if (old.period === q.period && old.period_start === startIso) continue
+      const reason = old.period !== q.period
+        ? `定额周期调整（${PERIOD_LABEL[old.period]}→${PERIOD_LABEL[q.period]}），原周期告警自动结转关闭`
+        : '周期结束自动结转关闭'
+      stmts.closeAlert.run('ignored', appendNote(old.note, reason), iso, iso, old.id)
       changed = true
+    }
+
+    if (!q.enabled) {
+      // 停用即解除：避免停用期间实时折算继续触发误报；重新启用且仍超限时会重开告警
+      for (const old of stmts.openByQuota.all(q.id)) {
+        stmts.closeAlert.run('ignored', appendNote(old.note, '定额已停用，告警自动解除'), iso, iso, old.id)
+        changed = true
+      }
+      continue
     }
 
     const used = computeUsage(q, at)
     const ratio = used / q.limit_kwh
     const level = ratio >= 1 ? 'error' : ratio >= WARN_RATIO ? 'warn' : null
-    const alert = stmts.activeAlert.get(q.id, start.toISOString())
+    const alert = stmts.activeAlert.get(q.id, q.period, startIso)
 
-    if (level && !alert) {
+    if (!level) {
+      // 用量回落到 80% 以下（如上调额度）：未闭环告警自动解除，避免误报
+      if (alert && alert.status !== 'resolved' && alert.status !== 'ignored') {
+        stmts.closeAlert.run('ignored', appendNote(alert.note,
+          `定额调整为 ${q.limit_kwh}kWh 后用量占比 ${Math.round(ratio * 100)}%，告警自动解除`),
+          iso, iso, alert.id)
+        changed = true
+      }
+      continue
+    }
+
+    if (!alert) {
       stmts.insertAlert.run(q.id, q.scope, q.target_name, q.period,
-        start.toISOString(), end.toISOString(), level, used, q.limit_kwh,
-        at.toISOString(), at.toISOString())
+        startIso, end.toISOString(), level, used, q.limit_kwh, iso, iso, iso)
       notify(buildAlertLog(q, level, used), at.toLocaleString('zh-CN'))
       changed = true
-    } else if (alert && level === 'error' && alert.level === 'warn'
-               && alert.status !== 'resolved' && alert.status !== 'ignored') {
-      // 预警升级为超标
-      stmts.raiseAlert.run('error', used, q.limit_kwh, at.toISOString(), alert.id)
-      notify(buildAlertLog(q, 'error', used), at.toLocaleString('zh-CN'))
+      continue
+    }
+
+    const closed = alert.status === 'resolved' || alert.status === 'ignored'
+    const configChanged = alert.limit_kwh !== q.limit_kwh
+      || alert.period !== q.period || alert.target_name !== q.target_name || alert.scope !== q.scope
+    // 因系统自动处置（调额解除/停用解除/周期结转同身份）而关闭的告警，重新启用或配置变化
+    // 导致仍超限时重开一次；用户主动「已处理/忽略」的闭环不因用量自然增长复活，避免重复打扰。
+    // 只看最近一次处置（备注最后一段），避免被备注链中更早的「自动重开」误判。
+    const note = alert.note || ''
+    const lastAction = note.split('｜').pop()
+    const stopDismissed = /定额已停用，告警自动解除/.test(lastAction)
+    const autoDismissed = /告警自动解除|自动结转关闭/.test(lastAction)
+
+    if (closed) {
+      if (configChanged || autoDismissed) {
+        // 阈值/周期被重新调整 → 归因于调额；仅「停用→重新启用」（无配置变化）才记启用归因
+        const tail = level === 'error' ? '超标' : '达到预警线'
+        const reopenReason = !configChanged && stopDismissed
+          ? `重新启用后仍${tail === '超标' ? '超标' : '超预警线'}，自动重开`
+          : `定额调整后重新${tail}，自动重开`
+        stmts.reopenAlert.run('open', level, used, q.limit_kwh, q.scope, q.target_name, q.period,
+          startIso, end.toISOString(), appendNote(note, reopenReason),
+          iso, iso, alert.id)
+        notify(buildAlertLog(q, level, used, true), at.toLocaleString('zh-CN'))
+        changed = true
+      } else if (Math.abs(alert.used_kwh - used) >= 0.0001 || alert.limit_kwh !== q.limit_kwh) {
+        // 闭环记录只刷新读数/快照，不复活状态
+        stmts.refreshAlert.run(q.scope, q.target_name, end.toISOString(),
+          alert.level, used, q.limit_kwh, iso, alert.id)
+        changed = true
+      }
+      continue
+    }
+
+    // 未闭环：级别按最新阈值重定（warn→error 升级 / error→warn 降级），快照同步刷新
+    if (alert.level !== level || configChanged || alert.period_end !== end.toISOString()) {
+      stmts.refreshAlert.run(q.scope, q.target_name, end.toISOString(), level, used, q.limit_kwh, iso, alert.id)
       changed = true
-    } else if (alert && Math.abs(alert.used_kwh - used) >= 0.0001) {
-      // 用量持续变化：同步最新用量（已处理/已忽略的告警只更新读数，不复活状态）
-      stmts.touchAlert.run(used, at.toISOString(), alert.id)
+      if (alert.level === 'warn' && level === 'error') {
+        notify(buildAlertLog(q, 'error', used), at.toLocaleString('zh-CN'))
+        stmts.markNotified.run(iso, alert.id)
+      }
+    } else if (Math.abs(alert.used_kwh - used) >= 0.0001) {
+      // 用量持续变化：同步最新用量
+      stmts.touchAlert.run(used, iso, alert.id)
       changed = true
     }
   }
@@ -190,7 +337,7 @@ export function evaluateAll(at = new Date()) {
   for (const a of stmts.openAlerts.all()) {
     if (!liveQuotaIds.has(a.quota_id)) {
       stmts.closeAlert.run('ignored', appendNote(a.note, '定额已删除，告警自动解除'),
-        at.toISOString(), at.toISOString(), a.id)
+        iso, iso, a.id)
       changed = true
     }
   }
@@ -201,11 +348,11 @@ function appendNote(note, text) {
   return note ? `${note} ｜ ${text}` : text
 }
 
-function buildAlertLog(q, level, used) {
+function buildAlertLog(q, level, used, reopened = false) {
   const tag = level === 'error' ? '超标告警' : '超标预警'
   return {
     device: level === 'error' ? '🚨' : '⚠️',
-    action: `能耗${tag}`,
+    action: reopened ? `能耗${tag}·重开` : `能耗${tag}`,
     detail: `${q.scope === 'room' ? '房间' : '设备'}「${q.target_name}」${PERIOD_LABEL[q.period]}定额 ${q.limit_kwh}kWh，当前已用 ${used.toFixed(2)}kWh（${Math.round((used / q.limit_kwh) * 100)}%）`
   }
 }
@@ -239,7 +386,8 @@ export function createQuota({ scope, room_id, device_id, period, limit_kwh, reas
   const at = new Date()
   const r = stmts.insertQuota.run(scope, roomId, deviceId, targetName, period, round4(limit), 1,
     at.toISOString(), at.toISOString())
-  stmts.insertAdj.run(r.lastInsertRowid, 'create', null, round4(limit), null, period, reason, at.toISOString())
+  stmts.insertAdj.run(r.lastInsertRowid, 'create', null, round4(limit), null, period,
+    scope, targetName, reason, at.toISOString())
   evaluateAll(at)
   return r.lastInsertRowid
 }
@@ -267,7 +415,7 @@ export function updateQuota(id, { limit_kwh, period, enabled, reason = '' }) {
   if (nextEnabled !== q.enabled) changes.push(nextEnabled ? '已启用' : '已停用')
   stmts.updateQuota.run(round4(nextLimit), nextPeriod, nextEnabled, at.toISOString(), id)
   stmts.insertAdj.run(id, nextEnabled !== q.enabled ? (nextEnabled ? 'enable' : 'disable') : 'update',
-    q.limit_kwh, round4(nextLimit), q.period, nextPeriod,
+    q.limit_kwh, round4(nextLimit), q.period, nextPeriod, q.scope, q.target_name,
     reason || changes.join('，'), at.toISOString())
   evaluateAll(at)
   return changes
@@ -277,7 +425,7 @@ export function deleteQuota(id, reason = '') {
   const q = stmts.quotaById.get(id)
   if (!q) throw new Error('定额不存在')
   const at = new Date()
-  stmts.insertAdj.run(id, 'delete', q.limit_kwh, null, q.period, null, reason, at.toISOString())
+  stmts.insertAdj.run(id, 'delete', q.limit_kwh, null, q.period, null, q.scope, q.target_name, reason, at.toISOString())
   stmts.deleteQuota.run(id)
   // 立即解除其未关闭告警
   evaluateAll(at)
@@ -303,7 +451,7 @@ export function listQuotas(at = new Date()) {
   return stmts.allQuotas.all().map((q) => {
     const { start, end } = periodRange(q.period, at)
     const used = q.enabled ? computeUsage(q, at) : 0
-    const alert = stmts.activeAlert.get(q.id, start.toISOString())
+    const alert = stmts.activeAlert.get(q.id, q.period, start.toISOString())
     const ratio = q.limit_kwh > 0 ? used / q.limit_kwh : 0
     return {
       id: q.id,
@@ -321,7 +469,8 @@ export function listQuotas(at = new Date()) {
       period_end: end.toISOString(),
       device_deleted: q.scope === 'device'
         && !db.prepare('SELECT id FROM devices WHERE id=?').get(q.device_id),
-      alert: alert ? {
+      // 仅未闭环（待处理/处理中）告警驱动看板状态与进度条颜色；已处理/已忽略不再让定额行报红
+      alert: alert && (alert.status === 'open' || alert.status === 'handling') ? {
         id: alert.id, level: alert.level, status: alert.status,
         status_label: STATUS_LABEL[alert.status],
         used_kwh: alert.used_kwh, note: alert.note
@@ -348,7 +497,8 @@ export function listAlerts(at = new Date()) {
     note: a.note,
     created_at: a.created_at,
     updated_at: a.updated_at,
-    handled_at: a.handled_at
+    handled_at: a.handled_at,
+    notified_at: a.notified_at
   }))
 }
 

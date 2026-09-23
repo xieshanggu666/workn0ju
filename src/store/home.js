@@ -24,8 +24,8 @@ export const useHomeStore = defineStore('home', {
     quotaAlerts: [],
     toast: null,
     timer: null,
-    // 已通知过的定额告警 id，轮询发现新增时弹 toast（仅本会话）
-    seenQuotaAlertIds: null
+    // 已通知过的定额告警通知批次（id + notified_at），升级/重开会产生新批次从而再次提醒；仅本会话
+    seenQuotaAlertKeys: null
   }),
   getters: {
     onlineCount: (s) => s.devices.filter((d) => d.status === 'online').length,
@@ -51,20 +51,23 @@ export const useHomeStore = defineStore('home', {
       this.loaded = true
       this.notifyNewQuotaAlerts(firstLoad)
     },
-    // 新触发（或由预警升级）的定额告警，按创建批次给一次桌面内通知；首次加载不打扰
+    // 新触发、预警升级超标、调额后重开的定额告警，按通知批次各提醒一次；首次加载不打扰
     notifyNewQuotaAlerts(firstLoad) {
       const active = this.quotaAlerts.filter((a) => a.status === 'open' || a.status === 'handling')
+      const keyOf = (a) => `${a.id}@${a.notified_at || a.created_at}`
       if (firstLoad) {
-        this.seenQuotaAlertIds = new Set(active.map((a) => a.id))
+        this.seenQuotaAlertKeys = new Set(active.map(keyOf))
         return
       }
-      if (this.seenQuotaAlertIds == null) this.seenQuotaAlertIds = new Set()
+      if (this.seenQuotaAlertKeys == null) this.seenQuotaAlertKeys = new Set()
       for (const a of active) {
-        if (!this.seenQuotaAlertIds.has(a.id)) {
-          this.seenQuotaAlertIds.add(a.id)
+        const key = keyOf(a)
+        if (!this.seenQuotaAlertKeys.has(key)) {
+          this.seenQuotaAlertKeys.add(key)
           const pct = Math.round((a.used_kwh / a.limit_kwh) * 100)
+          const reopened = !!a.notified_at && a.notified_at !== a.created_at
           this.toastMsg(
-            `${a.level === 'error' ? '🚨 超标告警' : '⚠️ 超标预警'}：${a.scope === 'room' ? '房间' : '设备'}「${a.target_name}」${a.period_label}定额已用 ${pct}%`,
+            `${a.level === 'error' ? '🚨 超标告警' : '⚠️ 超标预警'}${reopened ? '（重新触发）' : ''}：${a.scope === 'room' ? '房间' : '设备'}「${a.target_name}」${a.period_label}定额已用 ${pct}%`,
             a.level === 'error' ? 'warn' : 'info')
         }
       }
