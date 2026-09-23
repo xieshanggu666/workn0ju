@@ -239,8 +239,12 @@ const filteredAlerts = computed(() => {
 })
 
 function progClass(q) {
-  if (q.alert?.level === 'error') return 'over'
-  if (q.alert?.level === 'warn') return 'near'
+  // 已闭环（已处理/已忽略/自动解除）的历史告警不再染色，进度条按当前真实占比着色
+  const active = q.alert && (q.alert.status === 'open' || q.alert.status === 'handling')
+  if (active && q.alert.level === 'error') return 'over'
+  if (active && q.alert.level === 'warn') return 'near'
+  if (q.ratio >= 100) return 'over'
+  if (q.ratio >= 80) return 'near'
   if (q.ratio >= 50) return 'half'
   return ''
 }

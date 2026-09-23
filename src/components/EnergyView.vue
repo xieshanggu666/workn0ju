@@ -47,7 +47,7 @@
       <h4>📏 周期定额用量 <span class="more">配置/处理超标告警 →</span></h4>
       <div v-if="!store.quotas.length" class="empty">尚未配置能耗定额，可按房间/设备设置日、周、月用电额度，超标自动预警并闭环处理。</div>
       <div v-else class="qrows">
-        <div v-for="q in dailyQuotas" :key="q.id" class="qrow" :class="{over:q.alert?.level==='error',near:q.alert?.level==='warn',off:!q.enabled}">
+        <div v-for="q in dailyQuotas" :key="q.id" class="qrow" :class="rowClass(q)">
           <span class="ql">
             <i class="dot"></i>{{ q.target_name }}
             <em>{{ q.scope==='room'?'房间':'设备' }}·{{ q.period_label }}</em>
@@ -72,6 +72,16 @@ const hasDeleted = computed(() => store.energy.devices.some((d) => d.deleted || 
 // 用量占比最高的 6 条定额优先展示，超标风险一目了然
 const dailyQuotas = computed(() =>
   [...store.quotas].sort((a, b) => b.ratio - a.ratio).slice(0, 6))
+
+// 仅未闭环告警或当前真实占比越线才标红/橙，已闭环历史告警不残留旧颜色
+function rowClass(q) {
+  const active = q.alert && (q.alert.status === 'open' || q.alert.status === 'handling')
+  return {
+    over: (active && q.alert.level === 'error') || (!active && q.ratio >= 100),
+    near: (active && q.alert.level === 'warn') || (!active && q.ratio >= 80 && q.ratio < 100),
+    off: !q.enabled
+  }
+}
 
 function pct(v) {
   const max = Math.max(...store.energy.rooms.map((r) => r.v), 0.001)

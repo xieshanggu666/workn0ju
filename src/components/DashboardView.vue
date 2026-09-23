@@ -62,7 +62,7 @@
         <h4>📏 能耗定额执行（点击进入定额闭环管理）</h4>
         <div v-if="!store.quotas.length" class="none">尚未配置定额，可按房间/设备设置日、周、月用电额度</div>
         <div v-else class="q-grid">
-          <div v-for="q in store.quotas.slice(0,8)" :key="q.id" class="q-item" :class="{over:q.alert?.level==='error',near:q.alert?.level==='warn'}">
+          <div v-for="q in store.quotas.slice(0,8)" :key="q.id" class="q-item" :class="qClass(q)">
             <div class="q-top">
               <b>{{ q.target_name }}</b>
               <span>{{ q.scope==='room'?'房间':'设备' }} · {{ q.period_label }}</span>
@@ -111,6 +111,15 @@ const chartData = computed(() => {
     color: a.v > max * 0.7 ? '#ff7043' : '#42a5f5'
   }))
 })
+
+// 定额卡片着色：未闭环告警按级别，已闭环的只按当前真实占比，不残留旧告警颜色
+function qClass(q) {
+  const active = q.alert && (q.alert.status === 'open' || q.alert.status === 'handling')
+  return {
+    over: (active && q.alert.level === 'error') || q.ratio >= 100,
+    near: (active && q.alert.level === 'warn') || q.ratio >= 80 && q.ratio < 100
+  }
+}
 </script>
 
 <style scoped>

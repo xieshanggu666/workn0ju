@@ -3,9 +3,10 @@
 // energy_records 中已结分段 + energy_segments 中未结运行段（功率×时长实时
 // 折算）聚合到当前周期用量，达到额度 80% 触发预警、100% 触发超标告警。
 //
-// 闭环：同一额度同一周期只保留一条未关闭告警（预警可升级为超标，不重复打扰）；
+// 闭环：告警身份 = 额度 × 周期粒度 × 周期起点，同一身份只保留一条；
+// 预警可升级为超标（不重复打扰）；额度上调后误报自动解除、下调后重新越线可重开重报；
 // 告警保留 待处理→处理中→已处理/已忽略 状态与备注；额度调整留痕可追溯；
-// 跨周期旧告警自动结转关闭；额度删除后其未关闭告警自动解除。
+// 跨周期旧告警自动结转关闭、换周期旧周期告警按快照结存；额度停用/删除后未关闭告警自动解除。
 
 const TICK_MS = 30_000          // 与 energy.js 模拟节拍一致：持续聚合、及时触发
 const WARN_RATIO = 0.8          // 用量达额度 80% 预警
@@ -13,12 +14,90 @@ const MAX_LIVE_MS = 3600_000    // 未结段实时折算最长补 1h（服务重
 
 const PERIOD_LABEL = { daily: '每日', weekly: '每周', monthly: '每月' }
 const STATUS_LABEL = { open: '待处理', handling: '处理中', resolved: '已处理', ignored: '已忽略' }
+// 合法的人工状态流转：resolved/ignored 只能先「重新打开」回到待处理
+const NEXT_STATUS = {
+  open: ['handling', 'resolved', 'ignored'],
+  handling: ['open', 'resolved', 'ignored'],
+  resolved: ['open'],
+  ignored: ['open']
+}
 
 let db
 let stmts
 // 通过注入回调写日志/通知，避免与 index.js 循环依赖
 let notify = () => {}
 const round4 = (v) => Math.round(v * 10000) / 10000
+
+// ===== 告警表建表 / 旧库迁移 =====
+// 旧版唯一键 UNIQUE(quota_id, period_start) 不含周期粒度：额度换周期且新旧窗口起点
+// 相同时（如周一 日→周），旧告警会被新周期窗口错误认领，沿用旧 period/阈值。
+// 迁移到 UNIQUE(quota_id, period, period_start)，历史行原样保留。
+function migrateAlertsTable() {
+  const cols = db.prepare("PRAGMA table_info(quota_alerts)").all()
+  const fresh = cols.length === 0
+  if (fresh) {
+    db.exec(`
+    CREATE TABLE quota_alerts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      quota_id INTEGER NOT NULL,         -- 额度删除不级联，告警按快照保留
+      scope TEXT NOT NULL,
+      target_name TEXT NOT NULL,
+      period TEXT NOT NULL,
+      period_start TEXT NOT NULL,        -- 告警所属周期起点（本地零点 ISO）
+      period_end TEXT NOT NULL,
+      level TEXT NOT NULL,               -- warn(80%) / error(100%)
+      used_kwh REAL NOT NULL,
+      limit_kwh REAL NOT NULL,           -- 最近一次系统同步时的阈值快照（当前周期告警始终跟随现额度）
+      status TEXT NOT NULL DEFAULT 'open',  -- open / handling / resolved / ignored
+      note TEXT NOT NULL DEFAULT '',
+      auto_closed INTEGER NOT NULL DEFAULT 0, -- 1=系统自动解除（可同周期再越线重开重报）；人工处理后归 0
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      handled_at TEXT,
+      UNIQUE(quota_id, period, period_start)
+    );
+    CREATE INDEX idx_quota_alerts_status ON quota_alerts(status);
+    CREATE INDEX idx_quota_alerts_quota ON quota_alerts(quota_id);
+    `)
+    return
+  }
+  const hasAutoClosed = cols.some((c) => c.name === 'auto_closed')
+  const idx = db.prepare("PRAGMA index_list(quota_alerts)").all()
+    .find((i) => i.unique && db.prepare(`PRAGMA index_info('${i.name}')`).all()
+      .map((c) => c.name).join(',') === 'quota_id,period,period_start')
+  if (hasAutoClosed && idx) return
+  db.exec('PRAGMA foreign_keys=OFF')
+  db.exec(`
+  ALTER TABLE quota_alerts RENAME TO quota_alerts_old;
+  CREATE TABLE quota_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quota_id INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    target_name TEXT NOT NULL,
+    period TEXT NOT NULL,
+    period_start TEXT NOT NULL,
+    period_end TEXT NOT NULL,
+    level TEXT NOT NULL,
+    used_kwh REAL NOT NULL,
+    limit_kwh REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    note TEXT NOT NULL DEFAULT '',
+    auto_closed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    handled_at TEXT,
+    UNIQUE(quota_id, period, period_start)
+  );
+  INSERT INTO quota_alerts
+    (id,quota_id,scope,target_name,period,period_start,period_end,level,used_kwh,limit_kwh,status,note,auto_closed,created_at,updated_at,handled_at)
+  SELECT id,quota_id,scope,target_name,period,period_start,period_end,level,used_kwh,limit_kwh,status,note,0,created_at,updated_at,handled_at
+  FROM quota_alerts_old;
+  DROP TABLE quota_alerts_old;
+  CREATE INDEX IF NOT EXISTS idx_quota_alerts_status ON quota_alerts(status);
+  CREATE INDEX IF NOT EXISTS idx_quota_alerts_quota ON quota_alerts(quota_id);
+  `)
+  db.exec('PRAGMA foreign_keys=ON')
+}
 
 export function initQuota(database, notifyFn) {
   db = database
@@ -37,26 +116,6 @@ export function initQuota(database, notifyFn) {
     updated_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_energy_quotas_scope ON energy_quotas(scope);
-  CREATE TABLE IF NOT EXISTS quota_alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    quota_id INTEGER NOT NULL,         -- 额度删除不级联，告警按快照保留
-    scope TEXT NOT NULL,
-    target_name TEXT NOT NULL,
-    period TEXT NOT NULL,
-    period_start TEXT NOT NULL,       -- 告警所属周期起点，周期粒度去重/结转依据
-    period_end TEXT NOT NULL,
-    level TEXT NOT NULL,              -- warn(80%) / error(100%)
-    used_kwh REAL NOT NULL,
-    limit_kwh REAL NOT NULL,
-    status TEXT NOT NULL DEFAULT 'open',  -- open / handling / resolved / ignored
-    note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    handled_at TEXT,
-    UNIQUE(quota_id, period_start)
-  );
-  CREATE INDEX IF NOT EXISTS idx_quota_alerts_status ON quota_alerts(status);
-  CREATE INDEX IF NOT EXISTS idx_quota_alerts_quota ON quota_alerts(quota_id);
   CREATE TABLE IF NOT EXISTS quota_adjustments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     quota_id INTEGER NOT NULL,
@@ -70,6 +129,8 @@ export function initQuota(database, notifyFn) {
   );
   CREATE INDEX IF NOT EXISTS idx_quota_adjustments_quota ON quota_adjustments(quota_id);
   `)
+  // 告警表：身份唯一键必须包含 period（额度调整周期后旧周期告警结存，新周期另立身份）
+  migrateAlertsTable()
   stmts = {
     allQuotas: db.prepare('SELECT * FROM energy_quotas ORDER BY id'),
     quotaById: db.prepare('SELECT * FROM energy_quotas WHERE id=?'),
@@ -90,15 +151,28 @@ export function initQuota(database, notifyFn) {
     recDevice: db.prepare('SELECT COALESCE(SUM(kwh),0) v FROM energy_records WHERE device_id=? AND end_time>=?'),
     segRoom: db.prepare('SELECT * FROM energy_segments WHERE room=?'),
     segDevice: db.prepare('SELECT * FROM energy_segments WHERE device_id=?'),
-    activeAlert: db.prepare('SELECT * FROM quota_alerts WHERE quota_id=? AND period_start=?'),
+    // 当前周期窗口的告警：身份 = 额度 × 周期粒度 × 周期起点
+    activeAlert: db.prepare('SELECT * FROM quota_alerts WHERE quota_id=? AND period=? AND period_start=?'),
+    alertById: db.prepare('SELECT * FROM quota_alerts WHERE id=?'),
     insertAlert: db.prepare(`INSERT INTO quota_alerts
       (quota_id,scope,target_name,period,period_start,period_end,level,used_kwh,limit_kwh,status,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)`),
-    raiseAlert: db.prepare('UPDATE quota_alerts SET level=?,used_kwh=?,limit_kwh=?,updated_at=? WHERE id=?'),
-    touchAlert: db.prepare('UPDATE quota_alerts SET used_kwh=?,updated_at=? WHERE id=?'),
+    // 活动告警级别/读数/阈值/周期窗口整体同步（升级、降级都走它，避免旧阈值旧周期残留）
+    raiseAlert: db.prepare('UPDATE quota_alerts SET level=?,used_kwh=?,limit_kwh=?,period_end=?,updated_at=? WHERE id=?'),
+    touchAlert: db.prepare('UPDATE quota_alerts SET used_kwh=?,limit_kwh=?,updated_at=? WHERE id=?'),
+    // 系统自动解除关闭：置 auto_closed=1，允许同周期再次越线时重开重报
+    sysCloseAlert: db.prepare(`UPDATE quota_alerts SET status='ignored',note=?,handled_at=?,updated_at=?,auto_closed=1
+                               WHERE id=?`),
+    // 系统重开（仅限 auto_closed=1 的已关闭告警）：状态/级别/阈值/窗口全部按当前身份重算
+    reopenAlert: db.prepare(`UPDATE quota_alerts SET status='open',level=?,used_kwh=?,limit_kwh=?,
+                             period_end=?,note='',handled_at=NULL,auto_closed=0,
+                             created_at=?,updated_at=? WHERE id=?`),
+    // 人工操作：auto_closed 一律归零（用户处理过的告警不再被系统自动复活）
+    manualAlert: db.prepare('UPDATE quota_alerts SET status=?,note=?,handled_at=?,auto_closed=0,updated_at=? WHERE id=?'),
     openAlerts: db.prepare("SELECT * FROM quota_alerts WHERE status IN ('open','handling')"),
-    staleByQuota: db.prepare("SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling') AND period_start<>?"),
-    closeAlert: db.prepare('UPDATE quota_alerts SET status=?,note=?,handled_at=?,updated_at=? WHERE id=?')
+    staleByQuota: db.prepare(`SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling')
+                              AND (period<>? OR period_start<>?)`),
+    disabledByQuota: db.prepare("SELECT * FROM quota_alerts WHERE quota_id=? AND status IN ('open','handling')")
   }
 
   seedQuotas()
@@ -147,41 +221,85 @@ function computeUsage(quota, at = new Date()) {
   return round4(v)
 }
 
-// ===== 核心评估：全量额度聚合 → 触发/升级/更新告警；跨周期与已删额度结转 =====
+// ===== 核心评估：全量额度聚合 → 触发/升级/降级/解除/重开；跨周期、停用与已删额度结转 =====
 export function evaluateAll(at = new Date()) {
   const quotas = stmts.allQuotas.all()
   const liveQuotaIds = new Set(quotas.map((q) => q.id))
   let changed = false
+  // 本次评估产生的通知，先关后开，最后按顺序统一写入时间线，避免同一身份同节拍重复通知
+  const events = []
+  const atIso = at.toISOString()
+  const sysClose = (a, reason, logFn) => {
+    stmts.sysCloseAlert.run(appendNote(a.note, reason), atIso, atIso, a.id)
+    events.push({ logFn })
+    changed = true
+  }
 
   for (const q of quotas) {
-    if (!q.enabled) continue
     const { start, end } = periodRange(q.period, at)
-    // 跨周期：上一周期仍未关闭的告警自动结转（关闭），新周期重新评估
-    for (const old of stmts.staleByQuota.all(q.id, start.toISOString())) {
-      stmts.closeAlert.run('ignored', appendNote(old.note, '周期结束自动结转关闭'), at.toISOString(), at.toISOString(), old.id)
-      changed = true
+    const startIso = start.toISOString()
+
+    // 跨周期 / 换周期：不属于当前周期身份的未关闭告警，按其旧周期快照结存关闭
+    // （周期调整造成的身份切换写「调整周期」，自然跨周期写「周期结束」）
+    for (const old of stmts.staleByQuota.all(q.id, q.period, startIso)) {
+      const reason = old.period !== q.period
+        ? `定额周期已由${PERIOD_LABEL[old.period]}调整为${PERIOD_LABEL[q.period]}，旧周期告警结存关闭`
+        : '周期结束自动结转关闭'
+      sysClose(old, reason, () => buildCloseLog(old, reason))
+    }
+
+    if (!q.enabled) {
+      // 停用额度：其当前窗口未关闭告警立即解除，避免停用后继续误报
+      // （旧窗口的已在上一步「结存关闭」处理，此查询取的是结存后的最新状态）
+      for (const old of stmts.disabledByQuota.all(q.id)) {
+        sysClose(old, '定额已停用，告警自动解除', () => buildCloseLog(old, '定额已停用，告警自动解除'))
+      }
+      continue
     }
 
     const used = computeUsage(q, at)
     const ratio = used / q.limit_kwh
     const level = ratio >= 1 ? 'error' : ratio >= WARN_RATIO ? 'warn' : null
-    const alert = stmts.activeAlert.get(q.id, start.toISOString())
+    const alert = stmts.activeAlert.get(q.id, q.period, startIso)
 
-    if (level && !alert) {
-      stmts.insertAlert.run(q.id, q.scope, q.target_name, q.period,
-        start.toISOString(), end.toISOString(), level, used, q.limit_kwh,
-        at.toISOString(), at.toISOString())
-      notify(buildAlertLog(q, level, used), at.toLocaleString('zh-CN'))
+    if (!alert) {
+      if (level) {
+        stmts.insertAlert.run(q.id, q.scope, q.target_name, q.period,
+          startIso, end.toISOString(), level, used, q.limit_kwh, atIso, atIso)
+        events.push({ logFn: () => buildAlertLog(q, level, used) })
+        changed = true
+      }
+      continue
+    }
+
+    const active = alert.status === 'open' || alert.status === 'handling'
+    if (!level) {
+      // 额度上调（或自然回落）导致用量低于预警线：该配置下的告警生命周期结束，
+      // 无论此前是活动态还是用户已忽略，统一按系统解除结存（auto_closed=1，允许再越线重开）
+      const reason = `用量已回落至预警线以下（当前额度 ${q.limit_kwh}kWh），告警自动解除`
+      sysClose(alert, reason, () => buildCloseLog(alert, reason))
+    } else if (active) {
+      if (alert.level !== level || Math.abs(alert.limit_kwh - q.limit_kwh) >= 0.0001
+          || alert.period_end !== end.toISOString()) {
+        // 升级（warn→error，通知）或下调额度后的降级（error→warn，静默不重复通知）；
+        // 阈值/周期窗口同步刷新，告警中心与看板不再出现旧阈值旧百分比
+        stmts.raiseAlert.run(level, used, q.limit_kwh, end.toISOString(), atIso, alert.id)
+        if (alert.level !== level)
+          events.push({ logFn: () => buildAlertLog(q, level, used), notify: alert.level === 'warn' && level === 'error' })
+        changed = true
+      } else if (Math.abs(alert.used_kwh - used) >= 0.0001 || Math.abs(alert.limit_kwh - q.limit_kwh) >= 0.0001) {
+        // 读数持续变化：同步用量与当前阈值
+        stmts.touchAlert.run(used, q.limit_kwh, atIso, alert.id)
+        changed = true
+      }
+    } else if (alert.auto_closed) {
+      // 系统自动解除（调额/停用/结转）后，同周期再次越线：重开并按新阈值通知一次
+      stmts.reopenAlert.run(level, used, q.limit_kwh, end.toISOString(), atIso, atIso, alert.id)
+      events.push({ logFn: () => buildAlertLog(q, level, used) })
       changed = true
-    } else if (alert && level === 'error' && alert.level === 'warn'
-               && alert.status !== 'resolved' && alert.status !== 'ignored') {
-      // 预警升级为超标
-      stmts.raiseAlert.run('error', used, q.limit_kwh, at.toISOString(), alert.id)
-      notify(buildAlertLog(q, 'error', used), at.toLocaleString('zh-CN'))
-      changed = true
-    } else if (alert && Math.abs(alert.used_kwh - used) >= 0.0001) {
-      // 用量持续变化：同步最新用量（已处理/已忽略的告警只更新读数，不复活状态）
-      stmts.touchAlert.run(used, at.toISOString(), alert.id)
+    } else if (Math.abs(alert.used_kwh - used) >= 0.0001 || Math.abs(alert.limit_kwh - q.limit_kwh) >= 0.0001) {
+      // 用户已闭环（resolved/ignored）且仍越线：只校准读数/阈值快照，不复活状态，不重复通知
+      stmts.touchAlert.run(used, q.limit_kwh, atIso, alert.id)
       changed = true
     }
   }
@@ -189,10 +307,14 @@ export function evaluateAll(at = new Date()) {
   // 额度已删除：残留未关闭告警自动解除
   for (const a of stmts.openAlerts.all()) {
     if (!liveQuotaIds.has(a.quota_id)) {
-      stmts.closeAlert.run('ignored', appendNote(a.note, '定额已删除，告警自动解除'),
-        at.toISOString(), at.toISOString(), a.id)
-      changed = true
+      sysClose(a, '定额已删除，告警自动解除', () => buildCloseLog(a, '定额已删除，告警自动解除'))
     }
+  }
+
+  // 统一发通知：触发/升级/重开与系统解除均写入时间线；仅级别下调静默（不打扰）
+  for (const e of events) {
+    if (e.notify === false) continue
+    notify(e.logFn(), at.toLocaleString('zh-CN'))
   }
   return changed
 }
@@ -207,6 +329,15 @@ function buildAlertLog(q, level, used) {
     device: level === 'error' ? '🚨' : '⚠️',
     action: `能耗${tag}`,
     detail: `${q.scope === 'room' ? '房间' : '设备'}「${q.target_name}」${PERIOD_LABEL[q.period]}定额 ${q.limit_kwh}kWh，当前已用 ${used.toFixed(2)}kWh（${Math.round((used / q.limit_kwh) * 100)}%）`
+  }
+}
+
+// 系统自动解除/结存关闭：以告警自身的旧快照记录（历史归属不被新周期/新阈值改写）
+function buildCloseLog(a, reason) {
+  return {
+    device: '✅',
+    action: '定额告警自动解除',
+    detail: `${a.scope === 'room' ? '房间' : '设备'}「${a.target_name}」${PERIOD_LABEL[a.period]}${a.level === 'error' ? '超标告警' : '预警'}：${reason}`
   }
 }
 
@@ -284,18 +415,39 @@ export function deleteQuota(id, reason = '') {
 }
 
 // ===== 告警处理闭环 =====
+// 状态机：open → handling → resolved/ignored，可退回 open；resolved/ignored 只能「重新打开」。
+// 重新打开必须重新越线，且自动同步最新周期窗口/阈值，杜绝把历史旧告警误开成新事件。
 export function handleAlert(id, { status, note }) {
-  const a = db.prepare('SELECT * FROM quota_alerts WHERE id=?').get(id)
+  const a = stmts.alertById.get(id)
   if (!a) throw new Error('告警不存在')
   if (!['open', 'handling', 'resolved', 'ignored'].includes(status)) throw new Error('处理状态无效')
+  if (!NEXT_STATUS[a.status].includes(status))
+    throw new Error(`不能从「${STATUS_LABEL[a.status]}」流转到「${STATUS_LABEL[status]}」，请先退回待处理`)
+
+  if (status === 'open') {
+    // 重新打开前校验：额度仍在、告警身份仍是当前周期、用量仍越线
+    const q = stmts.quotaById.get(a.quota_id)
+    if (!q || !q.enabled) throw new Error('定额已停用或删除，无法重新打开')
+    const { start, end } = periodRange(q.period)
+    if (q.period !== a.period || start.toISOString() !== a.period_start)
+      throw new Error('该告警属于已结束的旧周期，不能重新打开')
+    const used = computeUsage(q)
+    const level = used / q.limit_kwh >= 1 ? 'error' : used / q.limit_kwh >= WARN_RATIO ? 'warn' : null
+    if (!level) throw new Error('当前用量已低于预警线，无需重新打开')
+    const at = new Date()
+    const nextNote = note != null && String(note) ? appendNote(a.note, `重新打开：${String(note)}`) : a.note
+    stmts.raiseAlert.run(level, used, q.limit_kwh, end.toISOString(), at.toISOString(), a.id)
+    stmts.manualAlert.run('open', nextNote, null, at.toISOString(), a.id)
+    return stmts.alertById.get(id)
+  }
+
   const at = new Date()
   const nextNote = note != null ? String(note) : a.note
   const handled = status === 'resolved' || status === 'ignored'
     ? (a.handled_at || at.toISOString())
     : null
-  db.prepare('UPDATE quota_alerts SET status=?,note=?,handled_at=?,updated_at=? WHERE id=?')
-    .run(status, nextNote, handled, at.toISOString(), id)
-  return { status, note: nextNote }
+  stmts.manualAlert.run(status, nextNote, handled, at.toISOString(), id)
+  return stmts.alertById.get(id)
 }
 
 // ===== 给 /api/state 的序列化视图 =====
@@ -303,7 +455,7 @@ export function listQuotas(at = new Date()) {
   return stmts.allQuotas.all().map((q) => {
     const { start, end } = periodRange(q.period, at)
     const used = q.enabled ? computeUsage(q, at) : 0
-    const alert = stmts.activeAlert.get(q.id, start.toISOString())
+    const alert = stmts.activeAlert.get(q.id, q.period, start.toISOString())
     const ratio = q.limit_kwh > 0 ? used / q.limit_kwh : 0
     return {
       id: q.id,

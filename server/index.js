@@ -243,10 +243,10 @@ app.delete('/api/quota/:id', (req, res) => {
 app.post('/api/quota-alert/:id/handle', (req, res) => {
   try {
     const { status, note } = req.body || {}
-    const a = q1('SELECT * FROM quota_alerts WHERE id=?', req.params.id)
-    if (!a) return res.status(404).json({ error: '告警不存在' })
-    handleAlert(Number(req.params.id), { status, note })
-    const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: '退回待处理' }[status] || '更新状态'
+    const a0 = q1('SELECT * FROM quota_alerts WHERE id=?', req.params.id)
+    if (!a0) return res.status(404).json({ error: '告警不存在' })
+    const a = handleAlert(Number(req.params.id), { status, note })
+    const label = { handling: '开始处理', resolved: '标记已处理', ignored: '忽略告警', open: a0.status === 'handling' ? '退回待处理' : '重新打开' }[status] || '更新状态'
     const periodLabel = { daily: '每日', weekly: '每周', monthly: '每月' }[a.period] || a.period
     log(`${a.scope === 'room' ? '房间' : '设备'}·${a.target_name}`, `定额告警·${label}`,
       `${periodLabel}用量 ${a.used_kwh.toFixed(2)}/${a.limit_kwh}kWh` + (note ? `；备注：${note}` : ''))

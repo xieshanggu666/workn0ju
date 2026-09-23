@@ -24,8 +24,9 @@ export const useHomeStore = defineStore('home', {
     quotaAlerts: [],
     toast: null,
     timer: null,
-    // 已通知过的定额告警 id，轮询发现新增时弹 toast（仅本会话）
-    seenQuotaAlertIds: null
+    // 已通知过的定额告警身份签名（id → level:status）：
+    // 新建、warn→error 升级、系统自动解除后重开各通知一次；普通读数刷新/降级不重复通知
+    alertSig: null
   }),
   getters: {
     onlineCount: (s) => s.devices.filter((d) => d.status === 'online').length,
@@ -51,23 +52,42 @@ export const useHomeStore = defineStore('home', {
       this.loaded = true
       this.notifyNewQuotaAlerts(firstLoad)
     },
-    // 新触发（或由预警升级）的定额告警，按创建批次给一次桌面内通知；首次加载不打扰
+    // 新触发、预警升级超标、自动解除后重开的定额告警各给一次桌面内通知；
+    // 首次加载不打扰；普通用量刷新、级别下调不通知，同一身份不重复弹
     notifyNewQuotaAlerts(firstLoad) {
+      const sigOf = (a) => `${a.level}:${a.status}`
       const active = this.quotaAlerts.filter((a) => a.status === 'open' || a.status === 'handling')
-      if (firstLoad) {
-        this.seenQuotaAlertIds = new Set(active.map((a) => a.id))
-        return
+      const activeIds = new Set(active.map((a) => a.id))
+      if (firstLoad || this.alertSig == null) {
+        this.alertSig = new Map(active.map((a) => [a.id, sigOf(a)]))
+        if (firstLoad) return
       }
-      if (this.seenQuotaAlertIds == null) this.seenQuotaAlertIds = new Set()
+      // 已从活动列表消失（系统自动解除/人工闭环）的告警清除签名，
+      // 之后重开才能被识别为「重新进入活动态」
+      for (const id of [...this.alertSig.keys()]) {
+        if (!activeIds.has(id)) this.alertSig.delete(id)
+      }
       for (const a of active) {
-        if (!this.seenQuotaAlertIds.has(a.id)) {
-          this.seenQuotaAlertIds.add(a.id)
-          const pct = Math.round((a.used_kwh / a.limit_kwh) * 100)
-          this.toastMsg(
-            `${a.level === 'error' ? '🚨 超标告警' : '⚠️ 超标预警'}：${a.scope === 'room' ? '房间' : '设备'}「${a.target_name}」${a.period_label}定额已用 ${pct}%`,
-            a.level === 'error' ? 'warn' : 'info')
+        const prev = this.alertSig.get(a.id)
+        const cur = sigOf(a)
+        if (!prev || prev !== cur) {
+          if (!prev) {
+            // 新出现的活动告警（含自动解除后同周期重开）
+            this.pushQuotaToast(a)
+          } else {
+            const [prevLevel] = prev.split(':')
+            // warn→error 升级才补通知；error→warn 降级与普通状态流转不打扰
+            if (prevLevel === 'warn' && a.level === 'error') this.pushQuotaToast(a)
+          }
+          this.alertSig.set(a.id, cur)
         }
       }
+    },
+    pushQuotaToast(a) {
+      const pct = Math.round((a.used_kwh / a.limit_kwh) * 100)
+      this.toastMsg(
+        `${a.level === 'error' ? '🚨 超标告警' : '⚠️ 超标预警'}：${a.scope === 'room' ? '房间' : '设备'}「${a.target_name}」${a.period_label}定额已用 ${pct}%`,
+        a.level === 'error' ? 'warn' : 'info')
     },
     // 看板趋势/实时用电随模拟节拍轻量刷新；轮询失败静默（手动操作仍会立即拉取）
     startAutoRefresh() {
